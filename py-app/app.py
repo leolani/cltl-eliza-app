@@ -56,7 +56,8 @@ from cltl_service.keyword.service import KeywordService
 
 from emissor.representation.util import serializer as emissor_serializer
 
-logging.config.fileConfig('config/logging.config', disable_existing_loggers=False)
+logging.config.fileConfig(os.environ.get('CLTL_LOGGING_CONFIG', default='config/logging.config'),
+                          disable_existing_loggers=False)
 logger = logging.getLogger(__name__)
 
 
@@ -77,11 +78,23 @@ class RemoteTextOutput(TextOutput):
 
         # animation = gestures.BOW
         animation = f"{random.choice(list(GestureType))}"
-        print("THIS IS WHAT YOU SHOULD VERBALIZE FOR US:", text, animation)
 
         response = f"\\^startTag({animation}){text}^stopTag({animation})"  #### cannot pass in strings with quotes!!
+        logger.debug("Remote text output: %s, %s", text, animation)
 
         requests.post(f"{self._remote_url}/text", data=response, headers=tts_headers)
+
+
+class PlainRemoteTextOutput(TextOutput):
+    def __init__(self, remote_url: str):
+        self._remote_url = remote_url
+
+    def consume(self, text: str, language=None):
+        tts_headers = {'Content-type': 'text/plain'}
+
+        logger.debug("Remote text output: %s", text)
+
+        requests.post(f"{self._remote_url}/text", data=text, headers=tts_headers)
 
 
 class BackendContainer(InfraContainer):
@@ -110,8 +123,11 @@ class BackendContainer(InfraContainer):
     def text_output(self) -> TextOutput:
         config = self.config_manager.get_config("cltl.backend.text_output")
         remote_url = config.get("remote_url")
-        if remote_url:
+        animation = config.get_boolean("animation") if "animation" in config else True
+        if remote_url and animation:
             return RemoteTextOutput(remote_url)
+        if remote_url:
+            return PlainRemoteTextOutput(remote_url)
         else:
             return ConsoleOutput()
 
