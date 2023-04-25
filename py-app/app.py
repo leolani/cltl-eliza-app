@@ -1,13 +1,7 @@
-import contextlib
-import json
 import logging.config
 import os
-from datetime import datetime
-import random
 
-import requests
 import time
-
 from cltl.backend.api.backend import Backend
 from cltl.backend.api.camera import CameraResolution, Camera
 from cltl.backend.api.microphone import Microphone
@@ -20,6 +14,7 @@ from cltl.backend.impl.sync_tts import SynchronizedTextToSpeech, TextOutputTTS
 from cltl.backend.server import BackendServer
 from cltl.backend.source.client_source import ClientAudioSource, ClientImageSource
 from cltl.backend.source.console_source import ConsoleOutput
+from cltl.backend.source.remote_tts import AnimatedRemoteTextOutput
 from cltl.backend.spi.audio import AudioSource
 from cltl.backend.spi.image import ImageSource
 from cltl.backend.spi.text import TextOutput
@@ -30,31 +25,31 @@ from cltl.combot.infra.config.k8config import K8LocalConfigurationContainer
 from cltl.combot.infra.di_container import singleton
 from cltl.combot.infra.event import Event
 from cltl.combot.infra.event.memory import SynchronousEventBusContainer
+from cltl.combot.infra.event_log import LogWriter
 from cltl.combot.infra.resource.threaded import ThreadedResourceContainer
 from cltl.eliza.api import Eliza
 from cltl.eliza.eliza import ElizaImpl
-from cltl.gestures.gestures import GestureType
 from cltl.vad.webrtc_vad import WebRtcVAD
 from cltl_service.asr.service import AsrService
 from cltl_service.backend.backend import BackendService
 from cltl_service.backend.storage import StorageService
+from cltl_service.bdi.service import BDIService
 from cltl_service.chatui.service import ChatUiService
+from cltl_service.combot.event_log.service import EventLogService
+from cltl_service.context.service import ContextService
 from cltl_service.eliza.service import ElizaService
 from cltl_service.intentions.init import InitService
+from cltl_service.keyword.service import KeywordService
 from cltl_service.vad.service import VadService
+from emissor.representation.util import serializer as emissor_serializer
 from flask import Flask
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from werkzeug.serving import run_simple
 
 from cltl.emissordata.api import EmissorDataStorage
 from cltl.emissordata.file_storage import EmissorDataFileStorage
-from cltl_service.bdi.service import BDIService
-from cltl_service.context.service import ContextService
 from cltl_service.emissordata.client import EmissorDataClient
 from cltl_service.emissordata.service import EmissorDataService
-from cltl_service.keyword.service import KeywordService
-
-from emissor.representation.util import serializer as emissor_serializer
 
 logging.config.fileConfig(os.environ.get('CLTL_LOGGING_CONFIG', default='config/logging.config'),
                           disable_existing_loggers=False)
@@ -67,34 +62,6 @@ class InfraContainer(SynchronousEventBusContainer, K8LocalConfigurationContainer
 
     def stop(self):
         pass
-
-
-class RemoteTextOutput(TextOutput):
-    def __init__(self, remote_url: str):
-        self._remote_url = remote_url
-
-    def consume(self, text: str, language=None):
-        tts_headers = {'Content-type': 'text/plain'}
-
-        # animation = gestures.BOW
-        animation = f"{random.choice(list(GestureType))}"
-
-        response = f"\\^startTag({animation}){text}^stopTag({animation})"  #### cannot pass in strings with quotes!!
-        logger.debug("Remote text output: %s, %s", text, animation)
-
-        requests.post(f"{self._remote_url}/text", data=response, headers=tts_headers)
-
-
-class PlainRemoteTextOutput(TextOutput):
-    def __init__(self, remote_url: str):
-        self._remote_url = remote_url
-
-    def consume(self, text: str, language=None):
-        tts_headers = {'Content-type': 'text/plain'}
-
-        logger.debug("Remote text output: %s", text)
-
-        requests.post(f"{self._remote_url}/text", data=text, headers=tts_headers)
 
 
 class BackendContainer(InfraContainer):
@@ -123,11 +90,9 @@ class BackendContainer(InfraContainer):
     def text_output(self) -> TextOutput:
         config = self.config_manager.get_config("cltl.backend.text_output")
         remote_url = config.get("remote_url")
-        animation = config.get_boolean("animation") if "animation" in config else True
-        if remote_url and animation:
-            return RemoteTextOutput(remote_url)
+        gestures = config.get("gestures", multi=True) if "gestures" in config else None
         if remote_url:
-            return PlainRemoteTextOutput(remote_url)
+            return AnimatedRemoteTextOutput(remote_url, gestures)
         else:
             return ConsoleOutput()
 
@@ -410,37 +375,29 @@ class ApplicationContainer(ElizaContainer, ElizaComponentsContainer,
                            ChatUIContainer,
                            ASRContainer, VADContainer,
                            EmissorStorageContainer, BackendContainer):
-    pass
+    @property
+    @singleton
+    def log_writer(self):
+        config = self.config_manager.get_config("cltl.event_log")
 
+        return LogWriter(config.get("log_dir"), serializer)
 
-def get_event_log_path(config):
-    log_dir = config.get('event_log')
-    date_now = datetime.now()
+    @property
+    @singleton
+    def event_log_service(self):
+        return EventLogService.from_config(self.log_writer, self.event_bus, self.config_manager)
 
-    os.makedirs(log_dir, exist_ok=True)
+    def start(self):
+        logger.info("Start EventLog")
+        super().start()
+        self.event_log_service.start()
 
-    return f"{log_dir}/{date_now :%y_%m_%d-%H_%M_%S}.json"
-
-
-@contextlib.contextmanager
-def event_log(event_bus, config):
-    def log_event(event):
+    def stop(self):
         try:
-            event_log.write(json.dumps(event, default=serializer, indent=2) + ',\n')
-        except:
-            logger.exception("Failed to write event: %s", event)
-
-    with open(get_event_log_path(config), "w") as event_log:
-        event_log.writelines(['['])
-
-        topics = event_bus.topics
-        for topic in topics:
-            event_bus.subscribe(topic, log_event)
-        logger.info("Subscribed %s to %s", event_log.name, topics)
-
-        yield None
-
-        event_log.writelines([']'])
+            logger.info("Stop EventLog")
+            self.event_log_service.stop()
+        finally:
+            super().stop()
 
 
 def serializer(obj):
@@ -455,35 +412,28 @@ def serializer(obj):
 
 def main():
     ApplicationContainer.load_configuration()
-
     logger.info("Initialized Application")
-
     application = ApplicationContainer()
-    application.start()
 
-    intention_topic = application.config_manager.get_config("cltl.bdi").get("topic_intention")
-    application.event_bus.publish(intention_topic, Event.for_payload(IntentionEvent(["init"])))
+    with application as started_app:
+        intention_topic = started_app.config_manager.get_config("cltl.bdi").get("topic_intention")
+        started_app.event_bus.publish(intention_topic, Event.for_payload(IntentionEvent(["init"])))
 
-    config = application.config_manager.get_config("cltl.leolani")
-    with event_log(application.event_bus, config):
         routes = {
-            '/storage': application.storage_service.app,
-            '/emissor': application.emissor_data_service.app,
-            '/chatui': application.chatui_service.app
+            '/storage': started_app.storage_service.app,
+            '/emissor': started_app.emissor_data_service.app,
+            '/chatui': started_app.chatui_service.app,
         }
-
-        if application.server:
-            routes['/host'] = application.server.app
+        if started_app.server:
+            routes['/host'] = started_app.server.app
 
         web_app = DispatcherMiddleware(Flask("Eliza app"), routes)
 
         run_simple('0.0.0.0', 8000, web_app, threaded=True, use_reloader=False, use_debugger=False, use_evalex=True)
 
-        intention_topic = application.config_manager.get_config("cltl.bdi").get("topic_intention")
-        application.event_bus.publish(intention_topic, Event.for_payload(IntentionEvent(["terminate"])))
+        intention_topic = started_app.config_manager.get_config("cltl.bdi").get("topic_intention")
+        started_app.event_bus.publish(intention_topic, Event.for_payload(IntentionEvent(["terminate"])))
         time.sleep(1)
-
-        application.stop()
 
 
 if __name__ == '__main__':
